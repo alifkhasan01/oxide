@@ -116,6 +116,119 @@ impl AddCommand {
         Ok(())
     }
 
+    fn add_dependency_to_cargo_toml(&self, deps: &[(&str, &str, &[&str])]) -> Result<()> {
+        let cargo_toml = std::fs::read_to_string("Cargo.toml")
+            .context("Failed to read Cargo.toml")?;
+
+        let mut lines: Vec<String> = cargo_toml.lines().map(String::from).collect();
+        let mut insert_pos = None;
+
+        // Find [dependencies] section
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim() == "[dependencies]" {
+                insert_pos = Some(i + 1);
+                break;
+            }
+        }
+
+        if let Some(pos) = insert_pos {
+            // Check if dependencies already exist
+            let existing_deps: Vec<String> = lines[pos..].iter()
+                .take_while(|l| !l.trim().is_empty() && !l.trim().starts_with('['))
+                .map(|l| l.trim().to_string())
+                .collect();
+
+            for (name, version, features) in deps {
+                let dep_name = name.to_string();
+                if existing_deps.iter().any(|d| d.starts_with(&format!("{} ", dep_name)) || d.starts_with(&format!("{}=", dep_name))) {
+                    continue; // Skip if already exists
+                }
+
+                let dep_str = if features.is_empty() {
+                    format!("{} = \"{}\"", name, version)
+                } else {
+                    let features_str = features.iter()
+                        .map(|f| format!("\"{}\"", f))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{} = {{ version = \"{}\", features = [{}] }}", name, version, features_str)
+                };
+
+                lines.insert(pos, dep_str);
+            }
+        }
+
+        std::fs::write("Cargo.toml", lines.join("\n"))
+            .context("Failed to write Cargo.toml")?;
+
+        Ok(())
+    }
+
+    fn update_nexus_toml(&self, section: &str, key: &str, value: &str) -> Result<()> {
+        let nexus_toml = std::fs::read_to_string("nexus.toml")
+            .context("Failed to read nexus.toml")?;
+
+        // Find the section and update the value
+        let mut lines: Vec<String> = nexus_toml.lines().map(String::from).collect();
+        let mut in_section = false;
+
+        for line in &mut lines {
+            if line.trim() == format!("[{}]", section) {
+                in_section = true;
+                continue;
+            }
+
+            if in_section && line.trim().starts_with('[') {
+                break;
+            }
+
+            if in_section && line.trim().starts_with(key) {
+                *line = format!("{} = \"{}\"", key, value);
+                break;
+            }
+        }
+
+        // If section doesn't exist, add it
+        if !lines.iter().any(|l| l.trim() == format!("[{}]", section)) {
+            lines.push(format!("\n[{}]", section));
+            lines.push(format!("{} = \"{}\"", key, value));
+        }
+
+        std::fs::write("nexus.toml", lines.join("\n"))
+            .context("Failed to write nexus.toml")?;
+
+        Ok(())
+    }
+
+    fn update_env_example(&self, key: &str, value: &str) -> Result<()> {
+        let mut env_content = std::fs::read_to_string(".env.example")
+            .unwrap_or_else(|_| "# Server configuration\nAPP_SERVER_HOST=127.0.0.1\nAPP_SERVER_PORT=3000\n\n# Logging\nRUST_LOG=info\n".to_string());
+
+        if !env_content.contains(key) {
+            env_content.push_str(&format!("\n# {}\n{}={}\n", key, key, value));
+        }
+        std::fs::write(".env.example", &env_content)
+            .context("Failed to write .env.example")?;
+
+        Ok(())
+    }
+
+    fn add_module_to_main_rs(&self, module_decl: &str) -> Result<()> {
+        let main_rs = std::fs::read_to_string("src/main.rs")
+            .context("Failed to read main.rs")?;
+
+        if !main_rs.contains(module_decl) {
+            let main_rs = main_rs.replace(
+                "mod state;",
+                &format!("mod state;\n{}", module_decl)
+            );
+            std::fs::write("src/main.rs", main_rs)
+                .context("Failed to write main.rs")?;
+        }
+
+        Ok(())
+    }
+
     fn add_postgres(&self, project_name: &str) -> Result<()> {
         if self.dry_run {
             println!("{}", style("Dry run mode - no files will be modified").yellow());
@@ -130,23 +243,15 @@ impl AddCommand {
 
         println!("Adding PostgreSQL support...");
 
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        let cargo_toml = cargo_toml.replace(
-            "[dependencies]",
-            "[dependencies]\nsqlx = { version = \"0.8\", features = [\"runtime-tokio\", \"tls-rustls\", \"postgres\", \"chrono\", \"uuid\"] }\nchrono = { version = \"0.4\", features = [\"serde\"] }\nuuid = { version = \"1\", features = [\"v4\", \"serde\"] }"
-        );
-        std::fs::write("Cargo.toml", cargo_toml)
-            .context("Failed to write Cargo.toml")?;
+        // Add dependencies
+        self.add_dependency_to_cargo_toml(&[
+            ("sqlx", "0.8", &["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"]),
+            ("chrono", "0.4", &["serde"]),
+            ("uuid", "1", &["v4", "serde"]),
+        ])?;
 
         // Update nexus.toml
-        let nexus_toml = std::fs::read_to_string("nexus.toml")
-            .context("Failed to read nexus.toml")?;
-        let nexus_toml = nexus_toml.replace("[database]\nprovider = \"none\"", "[database]\nprovider = \"postgres\"");
-        std::fs::write("nexus.toml", nexus_toml)
-            .context("Failed to write nexus.toml")?;
+        self.update_nexus_toml("database", "provider", "postgres")?;
 
         // Create database.rs
         let db_rs = r#"use sqlx::postgres::PgPool;
@@ -169,50 +274,40 @@ pub async fn create_pool(database_url: &str) -> Result<PgPool> {
         std::fs::write("src/database.rs", db_rs)
             .context("Failed to write database.rs")?;
 
+        // Add database module to main.rs
+        self.add_module_to_main_rs("mod database;")?;
+
         // Update state.rs
-        let state_rs = format!(
-            r#"use anyhow::Result;
+        let state_rs = r#"use anyhow::Result;
 use sqlx::postgres::PgPool;
 
 #[derive(Clone)]
-pub struct AppState {{
+pub struct AppState {
     pub db: PgPool,
-}}
+}
 
-impl AppState {{
-    pub async fn new() -> Result<Self> {{
+impl AppState {
+    pub async fn new() -> Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set");
 
         let db = crate::database::create_pool(&database_url).await?;
 
-        Ok(Self {{ db }})
-    }}
-}}
-"#
-        );
+        Ok(Self { db })
+    }
+}
+"#;
         std::fs::write("src/state.rs", state_rs)
             .context("Failed to write state.rs")?;
 
         // Update .env.example
-        let mut env_content = std::fs::read_to_string(".env.example")
-            .unwrap_or_else(|_| "# Server configuration\nAPP_SERVER_HOST=127.0.0.1\nAPP_SERVER_PORT=3000\n\n# Logging\nRUST_LOG=info\n".to_string());
-
-        if !env_content.contains("DATABASE_URL") {
-            let db_url = format!(
-                "postgres://user:password@localhost:5432/{}",
-                project_name.replace('-', "_")
-            );
-            env_content.push_str(&format!("\n# Database\nDATABASE_URL={}\n", db_url));
-        }
-        std::fs::write(".env.example", &env_content)
-            .context("Failed to write .env.example")?;
+        let db_url = format!("postgres://user:password@localhost:5432/{}", project_name.replace('-', "_"));
+        self.update_env_example("DATABASE_URL", &db_url)?;
 
         // Create migrations directory
         std::fs::create_dir_all("migrations")
             .context("Failed to create migrations directory")?;
 
-        // Create initial migration
         let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
         let migration_dir = format!("migrations/{}_init", timestamp);
         std::fs::create_dir_all(&migration_dir)
@@ -247,23 +342,15 @@ impl AppState {{
 
         println!("Adding MySQL support...");
 
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        let cargo_toml = cargo_toml.replace(
-            "[dependencies]",
-            "[dependencies]\nsqlx = { version = \"0.8\", features = [\"runtime-tokio\", \"tls-rustls\", \"mysql\", \"chrono\", \"uuid\"] }\nchrono = { version = \"0.4\", features = [\"serde\"] }\nuuid = { version = \"1\", features = [\"v4\", \"serde\"] }"
-        );
-        std::fs::write("Cargo.toml", cargo_toml)
-            .context("Failed to write Cargo.toml")?;
+        // Add dependencies
+        self.add_dependency_to_cargo_toml(&[
+            ("sqlx", "0.8", &["runtime-tokio", "tls-rustls", "mysql", "chrono", "uuid"]),
+            ("chrono", "0.4", &["serde"]),
+            ("uuid", "1", &["v4", "serde"]),
+        ])?;
 
         // Update nexus.toml
-        let nexus_toml = std::fs::read_to_string("nexus.toml")
-            .context("Failed to read nexus.toml")?;
-        let nexus_toml = nexus_toml.replace("[database]\nprovider = \"none\"", "[database]\nprovider = \"mysql\"");
-        std::fs::write("nexus.toml", nexus_toml)
-            .context("Failed to write nexus.toml")?;
+        self.update_nexus_toml("database", "provider", "mysql")?;
 
         // Create database.rs
         let db_rs = r#"use sqlx::mysql::MySqlPool;
@@ -286,44 +373,35 @@ pub async fn create_pool(database_url: &str) -> Result<MySqlPool> {
         std::fs::write("src/database.rs", db_rs)
             .context("Failed to write database.rs")?;
 
+        // Add database module to main.rs
+        self.add_module_to_main_rs("mod database;")?;
+
         // Update state.rs
-        let state_rs = format!(
-            r#"use anyhow::Result;
+        let state_rs = r#"use anyhow::Result;
 use sqlx::mysql::MySqlPool;
 
 #[derive(Clone)]
-pub struct AppState {{
+pub struct AppState {
     pub db: MySqlPool,
-}}
+}
 
-impl AppState {{
-    pub async fn new() -> Result<Self> {{
+impl AppState {
+    pub async fn new() -> Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set");
 
         let db = crate::database::create_pool(&database_url).await?;
 
-        Ok(Self {{ db }})
-    }}
-}}
-"#
-        );
+        Ok(Self { db })
+    }
+}
+"#;
         std::fs::write("src/state.rs", state_rs)
             .context("Failed to write state.rs")?;
 
         // Update .env.example
-        let mut env_content = std::fs::read_to_string(".env.example")
-            .unwrap_or_else(|_| "# Server configuration\nAPP_SERVER_HOST=127.0.0.1\nAPP_SERVER_PORT=3000\n\n# Logging\nRUST_LOG=info\n".to_string());
-
-        if !env_content.contains("DATABASE_URL") {
-            let db_url = format!(
-                "mysql://user:password@localhost:3306/{}",
-                project_name.replace('-', "_")
-            );
-            env_content.push_str(&format!("\n# Database\nDATABASE_URL={}\n", db_url));
-        }
-        std::fs::write(".env.example", &env_content)
-            .context("Failed to write .env.example")?;
+        let db_url = format!("mysql://user:password@localhost:3306/{}", project_name.replace('-', "_"));
+        self.update_env_example("DATABASE_URL", &db_url)?;
 
         // Create migrations directory
         std::fs::create_dir_all("migrations")
@@ -363,23 +441,15 @@ impl AppState {{
 
         println!("Adding SQLite support...");
 
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        let cargo_toml = cargo_toml.replace(
-            "[dependencies]",
-            "[dependencies]\nsqlx = { version = \"0.8\", features = [\"runtime-tokio\", \"tls-rustls\", \"sqlite\", \"chrono\", \"uuid\"] }\nchrono = { version = \"0.4\", features = [\"serde\"] }\nuuid = { version = \"1\", features = [\"v4\", \"serde\"] }"
-        );
-        std::fs::write("Cargo.toml", cargo_toml)
-            .context("Failed to write Cargo.toml")?;
+        // Add dependencies
+        self.add_dependency_to_cargo_toml(&[
+            ("sqlx", "0.8", &["runtime-tokio", "tls-rustls", "sqlite", "chrono", "uuid"]),
+            ("chrono", "0.4", &["serde"]),
+            ("uuid", "1", &["v4", "serde"]),
+        ])?;
 
         // Update nexus.toml
-        let nexus_toml = std::fs::read_to_string("nexus.toml")
-            .context("Failed to read nexus.toml")?;
-        let nexus_toml = nexus_toml.replace("[database]\nprovider = \"none\"", "[database]\nprovider = \"sqlite\"");
-        std::fs::write("nexus.toml", nexus_toml)
-            .context("Failed to write nexus.toml")?;
+        self.update_nexus_toml("database", "provider", "sqlite")?;
 
         // Create database.rs
         let db_rs = r#"use sqlx::sqlite::SqlitePool;
@@ -401,6 +471,9 @@ pub async fn create_pool(database_url: &str) -> Result<SqlitePool> {
 "#;
         std::fs::write("src/database.rs", db_rs)
             .context("Failed to write database.rs")?;
+
+        // Add database module to main.rs
+        self.add_module_to_main_rs("mod database;")?;
 
         // Update state.rs
         let state_rs = r#"use anyhow::Result;
@@ -426,14 +499,7 @@ impl AppState {
             .context("Failed to write state.rs")?;
 
         // Update .env.example
-        let mut env_content = std::fs::read_to_string(".env.example")
-            .unwrap_or_else(|_| "# Server configuration\nAPP_SERVER_HOST=127.0.0.1\nAPP_SERVER_PORT=3000\n\n# Logging\nRUST_LOG=info\n".to_string());
-
-        if !env_content.contains("DATABASE_URL") {
-            env_content.push_str("\n# Database\nDATABASE_URL=sqlite::memory:\n");
-        }
-        std::fs::write(".env.example", &env_content)
-            .context("Failed to write .env.example")?;
+        self.update_env_example("DATABASE_URL", "sqlite::memory:")?;
 
         // Create migrations directory
         std::fs::create_dir_all("migrations")
@@ -471,33 +537,16 @@ impl AppState {
 
         println!("Adding Redis support...");
 
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        let cargo_toml = cargo_toml.replace(
-            "[dependencies]",
-            "[dependencies]\nredis = { version = \"0.26\", features = [\"tokio-comp\", \"connection-manager\"] }"
-        );
-        std::fs::write("Cargo.toml", cargo_toml)
-            .context("Failed to write Cargo.toml")?;
+        // Add dependencies
+        self.add_dependency_to_cargo_toml(&[
+            ("redis", "0.26", &["tokio-comp", "connection-manager"]),
+        ])?;
 
         // Update nexus.toml
-        let nexus_toml = std::fs::read_to_string("nexus.toml")
-            .context("Failed to read nexus.toml")?;
-        let nexus_toml = nexus_toml.replace("[cache]\nprovider = \"none\"", "[cache]\nprovider = \"redis\"");
-        std::fs::write("nexus.toml", nexus_toml)
-            .context("Failed to write nexus.toml")?;
+        self.update_nexus_toml("cache", "provider", "redis")?;
 
         // Update .env.example
-        let mut env_content = std::fs::read_to_string(".env.example")
-            .unwrap_or_else(|_| "# Server configuration\nAPP_SERVER_HOST=127.0.0.1\nAPP_SERVER_PORT=3000\n\n# Logging\nRUST_LOG=info\n".to_string());
-
-        if !env_content.contains("REDIS_URL") {
-            env_content.push_str("\n# Redis\nREDIS_URL=redis://localhost:6379\n");
-        }
-        std::fs::write(".env.example", &env_content)
-            .context("Failed to write .env.example")?;
+        self.update_env_example("REDIS_URL", "redis://localhost:6379")?;
 
         println!("  {} redis dependency", style("✓").green());
         println!("  {} Configuration", style("✓").green());
@@ -519,33 +568,19 @@ impl AppState {
 
         println!("Adding JWT authentication...");
 
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        let cargo_toml = cargo_toml.replace(
-            "[dependencies]",
-            "[dependencies]\njsonwebtoken = \"9\"\nargon2 = { version = \"0.5\", features = [\"std\"] }\nrand = \"0.8\""
-        );
-        std::fs::write("Cargo.toml", cargo_toml)
-            .context("Failed to write Cargo.toml")?;
+        // Add dependencies
+        self.add_dependency_to_cargo_toml(&[
+            ("jsonwebtoken", "9", &[]),
+            ("argon2", "0.5", &["std"]),
+            ("rand", "0.8", &[]),
+        ])?;
 
         // Update nexus.toml
-        let nexus_toml = std::fs::read_to_string("nexus.toml")
-            .context("Failed to read nexus.toml")?;
-        let nexus_toml = nexus_toml.replace("[auth]\nprovider = \"none\"", "[auth]\nprovider = \"jwt\"");
-        std::fs::write("nexus.toml", nexus_toml)
-            .context("Failed to write nexus.toml")?;
+        self.update_nexus_toml("auth", "provider", "jwt")?;
 
         // Update .env.example
-        let mut env_content = std::fs::read_to_string(".env.example")
-            .unwrap_or_else(|_| "# Server configuration\nAPP_SERVER_HOST=127.0.0.1\nAPP_SERVER_PORT=3000\n\n# Logging\nRUST_LOG=info\n".to_string());
-
-        if !env_content.contains("JWT_SECRET") {
-            env_content.push_str("\n# JWT\nJWT_SECRET=your-secret-key-here\nJWT_EXPIRATION=3600\n");
-        }
-        std::fs::write(".env.example", &env_content)
-            .context("Failed to write .env.example")?;
+        self.update_env_example("JWT_SECRET", "your-secret-key-here")?;
+        self.update_env_example("JWT_EXPIRATION", "3600")?;
 
         // Create auth middleware
         let auth_rs = r#"use axum::{
@@ -636,7 +671,6 @@ pub fn create_token(sub: &str) -> Result<String, StatusCode> {
         if self.dry_run {
             println!("{}", style("Dry run mode - no files will be modified").yellow());
             println!("\nWould modify:");
-            println!("  Cargo.toml");
             println!("  nexus.toml");
             println!("  src/middleware/cors.rs");
             println!("  src/routes/mod.rs");
@@ -644,20 +678,6 @@ pub fn create_token(sub: &str) -> Result<String, StatusCode> {
         }
 
         println!("Adding CORS support...");
-
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        // tower-http with cors feature should already be there, but let's make sure
-        if !cargo_toml.contains("tower-http") {
-            let cargo_toml = cargo_toml.replace(
-                "[dependencies]",
-                "[dependencies]\ntower-http = { version = \"0.6\", features = [\"cors\"] }"
-            );
-            std::fs::write("Cargo.toml", cargo_toml)
-                .context("Failed to write Cargo.toml")?;
-        }
 
         // Update nexus.toml
         let nexus_toml = std::fs::read_to_string("nexus.toml")
@@ -684,9 +704,14 @@ pub fn cors_layer() -> CorsLayer {
             .context("Failed to write cors middleware")?;
 
         // Update middleware/mod.rs
-        let mod_rs = r#"pub mod auth;
+        let mod_rs = if std::path::Path::new("src/middleware/auth.rs").exists() {
+            r#"pub mod auth;
 pub mod cors;
-"#;
+"#
+        } else {
+            r#"pub mod cors;
+"#
+        };
         std::fs::write("src/middleware/mod.rs", mod_rs)
             .context("Failed to write middleware/mod.rs")?;
 
@@ -704,7 +729,6 @@ pub fn router(state: AppState) -> Router {
         std::fs::write("src/routes/mod.rs", routes_rs)
             .context("Failed to write routes/mod.rs")?;
 
-        println!("  {} tower-http dependency", style("✓").green());
         println!("  {} Configuration", style("✓").green());
         println!("  {} CORS middleware", style("✓").green());
         println!("  {} Routes updated", style("✓").green());
@@ -724,16 +748,11 @@ pub fn router(state: AppState) -> Router {
 
         println!("Adding validation support...");
 
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        let cargo_toml = cargo_toml.replace(
-            "[dependencies]",
-            "[dependencies]\nvalidator = { version = \"0.18\", features = [\"derive\"] }\ngarde = \"0.18\""
-        );
-        std::fs::write("Cargo.toml", cargo_toml)
-            .context("Failed to write Cargo.toml")?;
+        // Add dependencies
+        self.add_dependency_to_cargo_toml(&[
+            ("validator", "0.18", &["derive"]),
+            ("garde", "0.18", &[]),
+        ])?;
 
         // Update nexus.toml
         let nexus_toml = std::fs::read_to_string("nexus.toml")
@@ -752,7 +771,6 @@ pub fn router(state: AppState) -> Router {
 
         // Create validation example
         let validators_mod_rs = r#"use axum::{
-    extract::FromRequest,
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -764,7 +782,6 @@ pub trait Validate {
 }
 
 pub async fn validate_request<T: Validate + serde::de::DeserializeOwned>(
-    axum::extract::State(_state): axum::extract::State<crate::state::AppState>,
     Json(payload): Json<T>,
 ) -> Result<T, (StatusCode, Json<serde_json::Value>)> {
     payload.validate().map_err(|e| {
@@ -805,16 +822,11 @@ pub async fn validate_request<T: Validate + serde::de::DeserializeOwned>(
 
         println!("Adding OpenAPI documentation...");
 
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        let cargo_toml = cargo_toml.replace(
-            "[dependencies]",
-            "[dependencies]\nutoipa = { version = \"4\", features = [\"axum_extras\"] }\nutoipa-swagger-ui = { version = \"7\", features = [\"axum\"] }"
-        );
-        std::fs::write("Cargo.toml", cargo_toml)
-            .context("Failed to write Cargo.toml")?;
+        // Add dependencies
+        self.add_dependency_to_cargo_toml(&[
+            ("utoipa", "4", &["axum_extras"]),
+            ("utoipa-swagger-ui", "7", &["axum"]),
+        ])?;
 
         // Update nexus.toml
         let nexus_toml = std::fs::read_to_string("nexus.toml")
@@ -896,24 +908,12 @@ pub fn router(state: AppState) -> Router {
         if self.dry_run {
             println!("{}", style("Dry run mode - no files will be modified").yellow());
             println!("\nWould modify:");
-            println!("  Cargo.toml");
             println!("  nexus.toml");
             println!("  src/handlers/ws.rs");
             return Ok(());
         }
 
         println!("Adding WebSocket support...");
-
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        let cargo_toml = cargo_toml.replace(
-            "[dependencies]",
-            "[dependencies]\naxum = { version = \"0.8\", features = [\"ws\"] }"
-        );
-        std::fs::write("Cargo.toml", cargo_toml)
-            .context("Failed to write Cargo.toml")?;
 
         // Update nexus.toml
         let nexus_toml = std::fs::read_to_string("nexus.toml")
@@ -963,7 +963,6 @@ async fn handle_socket(socket: WebSocket, _state: crate::state::AppState) {
         std::fs::write("src/handlers/ws.rs", ws_rs)
             .context("Failed to write WebSocket handler")?;
 
-        println!("  {} axum ws feature", style("✓").green());
         println!("  {} Configuration", style("✓").green());
         println!("  {} WebSocket handler", style("✓").green());
 
@@ -982,16 +981,11 @@ async fn handle_socket(socket: WebSocket, _state: crate::state::AppState) {
 
         println!("Adding rate limiting support...");
 
-        // Add dependencies to Cargo.toml
-        let cargo_toml = std::fs::read_to_string("Cargo.toml")
-            .context("Failed to read Cargo.toml")?;
-
-        let cargo_toml = cargo_toml.replace(
-            "[dependencies]",
-            "[dependencies]\ngovernor = \"0.7\"\ndashmap = \"5\""
-        );
-        std::fs::write("Cargo.toml", cargo_toml)
-            .context("Failed to write Cargo.toml")?;
+        // Add dependencies
+        self.add_dependency_to_cargo_toml(&[
+            ("governor", "0.7", &[]),
+            ("dashmap", "5", &[]),
+        ])?;
 
         // Update nexus.toml
         let nexus_toml = std::fs::read_to_string("nexus.toml")
@@ -1006,7 +1000,7 @@ async fn handle_socket(socket: WebSocket, _state: crate::state::AppState) {
 
         // Create rate limiter middleware
         let ratelimit_rs = r#"use axum::{
-    extract::{ConnectInfo, Request},
+    extract::Request,
     http::StatusCode,
     middleware::Next,
     response::Response,
@@ -1019,10 +1013,8 @@ use governor::{
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-type RateLimitMiddleware = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
-
 pub struct RateLimiterState {
-    pub limiter: Arc<RateLimitMiddleware>,
+    pub limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
 }
 
 impl RateLimiterState {
@@ -1051,10 +1043,25 @@ pub async fn rate_limit_middleware(
             .context("Failed to write rate limiter middleware")?;
 
         // Update middleware/mod.rs
-        let mod_rs = r#"pub mod auth;
+        let mod_rs = if std::path::Path::new("src/middleware/auth.rs").exists() {
+            if std::path::Path::new("src/middleware/cors.rs").exists() {
+                r#"pub mod auth;
 pub mod cors;
 pub mod ratelimit;
-"#;
+"#
+            } else {
+                r#"pub mod auth;
+pub mod ratelimit;
+"#
+            }
+        } else if std::path::Path::new("src/middleware/cors.rs").exists() {
+            r#"pub mod cors;
+pub mod ratelimit;
+"#
+        } else {
+            r#"pub mod ratelimit;
+"#
+        };
         std::fs::write("src/middleware/mod.rs", mod_rs)
             .context("Failed to write middleware/mod.rs")?;
 
