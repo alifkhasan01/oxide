@@ -54,7 +54,7 @@ impl ProjectGenerator {
 
     fn generate_cargo_toml(&self, path: &Path, stack: &Stack) -> Result<()> {
         let dependencies = stack.dependencies();
-        let mut deps_str: Vec<String> = dependencies.iter().map(|d| {
+        let deps_str: Vec<String> = dependencies.iter().map(|d| {
             if d.features.is_empty() {
                 format!("{} = \"{}\"", d.name, d.version)
             } else {
@@ -65,11 +65,6 @@ impl ProjectGenerator {
                 format!("{} = {{ version = \"{}\", features = [{}] }}", d.name, d.version, features)
             }
         }).collect();
-
-        // Add chrono for database migrations
-        if self.config.database != "None" {
-            deps_str.push("chrono = { version = \"0.4\", features = [\"serde\"] }".to_string());
-        }
 
         let cargo_toml = format!(
             r#"[package]
